@@ -1,5 +1,5 @@
 /*
- *  Copyright 2019-2023 Diligent Graphics LLC
+ *  Copyright 2019-2022 Diligent Graphics LLC
  *  Copyright 2015-2019 Egor Yusov
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +31,79 @@
 #include "SwapChainBase.hpp"
 #include "DXGITypeConversions.hpp"
 #include "GraphicsAccessories.hpp"
+
+// R"(C:\Program Files(x86)\Windows Kits\10\include\10.0.22621.0\winrt\inspectable.h)"
+#include <inspectable.h>
+// R"(C:\Program Files(x86)\Windows Kits\10\include\10.0.22621.0\um\windows.ui.xaml.media.dxinterop.h)"
+#include <windows.ui.xaml.media.dxinterop.h>
+
+namespace WinUI3
+{
+
+// https://learn.microsoft.com/en-us/windows/windows-app-sdk/api/win32/microsoft.ui.xaml.media.dxinterop/nn-microsoft-ui-xaml-media-dxinterop-iswapchainpanelnative
+MIDL_INTERFACE("63aad0b8-7c24-40ff-85a8-640d944cc325")
+ISwapChainPanelNative : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE SetSwapChain(
+        /* [annotation][in] */
+        _In_ IDXGISwapChain * swapChain) = 0;
+};
+
+// https://learn.microsoft.com/en-us/windows/windows-app-sdk/api/win32/microsoft.ui.xaml.media.dxinterop/nn-microsoft-ui-xaml-media-dxinterop-iswapchainbackgroundpanelnative
+MIDL_INTERFACE("24d43d84-4246-4aa7-9774-8604cb73d90d")
+ISwapChainBackgroundPanelNative : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE SetSwapChain(
+        /* [annotation][in] */
+        _In_ IDXGISwapChain * swapChain) = 0;
+};
+
+template <typename T>
+static bool trySetSwapChain(IInspectable* nativeWindow, IDXGISwapChain1* swapChain, HRESULT* hr)
+{
+    ISwapChainPanelNative* swapChainPanelNative;
+
+    if (FAILED(nativeWindow->QueryInterface(__uuidof(T), (void**)&swapChainPanelNative)) || NULL == swapChainPanelNative)
+    {
+        return false;
+    }
+
+    *hr = swapChainPanelNative->SetSwapChain(swapChain);
+    if (SUCCEEDED(*hr))
+    {
+        //DX_RELEASE_I(swapChainPanelNative);
+    }
+    else
+    {
+        //DX_RELEASE(swapChainPanelNative, 0);
+    }
+
+    return true;
+}
+
+static HRESULT setSwapChain(IInspectable* nativeWindow, IDXGISwapChain1* swapChain)
+{
+    HRESULT hr = S_OK;
+
+    if (trySetSwapChain<WinUI3::ISwapChainPanelNative>(nativeWindow, swapChain, &hr) || trySetSwapChain<WinUI3::ISwapChainBackgroundPanelNative>(nativeWindow, swapChain, &hr))
+    {
+        if (FAILED(hr))
+        {
+            //BX_TRACE("Failed to SetSwapChain, hr %x.");
+        }
+    }
+    else
+    {
+        //BX_TRACE("No available interface on native window to SetSwapChain.");
+    }
+
+    return hr;
+}
+
+} // namespace WinUI3
+
 
 /// \file
 /// Base implementation of a D3D swap chain
@@ -101,21 +174,11 @@ protected:
     void CreateDXGISwapChain(IUnknown* pD3D11DeviceOrD3D12CmdQueue)
     {
 #if PLATFORM_WIN32
-        auto hWnd = reinterpret_cast<HWND>(m_Window.hWnd);
+        auto hWnd = reinterpret_cast<IInspectable*>(m_Window.hWnd);
         if (m_SwapChainDesc.Width == 0 || m_SwapChainDesc.Height == 0)
         {
-            RECT rc;
-            if (m_FSDesc.Fullscreen)
-            {
-                const HWND hDesktop = GetDesktopWindow();
-                GetWindowRect(hDesktop, &rc);
-            }
-            else
-            {
-                GetClientRect(hWnd, &rc);
-            }
-            m_SwapChainDesc.Width  = rc.right - rc.left;
-            m_SwapChainDesc.Height = rc.bottom - rc.top;
+            m_SwapChainDesc.Width  = 1;
+            m_SwapChainDesc.Height = 1;
         }
 #endif
 
@@ -169,7 +232,7 @@ protected:
         //    ;
 
         swapChainDesc.BufferCount = m_SwapChainDesc.BufferCount;
-        swapChainDesc.Scaling     = DXGI_SCALING_NONE;
+        swapChainDesc.Scaling     = DXGI_SCALING_STRETCH;
 
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
         // DXGI_SCALING_NONE is supported starting with Windows 8
@@ -227,20 +290,23 @@ protected:
         FullScreenDesc.Scaling                 = static_cast<DXGI_MODE_SCALING>(m_FSDesc.Scaling);
         FullScreenDesc.ScanlineOrdering        = static_cast<DXGI_MODE_SCANLINE_ORDER>(m_FSDesc.ScanlineOrder);
 
-        hr = pDXGIFactory->CreateSwapChainForHwnd(pD3D11DeviceOrD3D12CmdQueue, hWnd, &swapChainDesc, &FullScreenDesc, nullptr, &pSwapChain1);
+        hr = pDXGIFactory->CreateSwapChainForComposition(pD3D11DeviceOrD3D12CmdQueue, &swapChainDesc, nullptr, &pSwapChain1);
         CHECK_D3D_RESULT_THROW(hr, "Failed to create Swap Chain");
 
-        {
-            // This is silly, but IDXGIFactory used for MakeWindowAssociation must be retrieved via
-            // calling IDXGISwapchain::GetParent first, otherwise it won't work
-            // https://www.gamedev.net/forums/topic/634235-dxgidisabling-altenter/?do=findComment&comment=4999990
-            CComPtr<IDXGIFactory1> pFactoryFromSC;
-            if (SUCCEEDED(pSwapChain1->GetParent(__uuidof(pFactoryFromSC), (void**)&pFactoryFromSC)))
-            {
-                // Do not allow the swap chain to handle Alt+Enter
-                pFactoryFromSC->MakeWindowAssociation(hWnd, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
-            }
-        }
+        hr = WinUI3::setSwapChain(hWnd, pSwapChain1);
+        CHECK_D3D_RESULT_THROW(hr, "Failed to set Swap Chain");
+
+        //{
+        //    // This is silly, but IDXGIFactory used for MakeWindowAssociation must be retrieved via
+        //    // calling IDXGISwapchain::GetParent first, otherwise it won't work
+        //    // https://www.gamedev.net/forums/topic/634235-dxgidisabling-altenter/?do=findComment&comment=4999990
+        //    CComPtr<IDXGIFactory1> pFactoryFromSC;
+        //    if (SUCCEEDED(pSwapChain1->GetParent(__uuidof(pFactoryFromSC), (void**)&pFactoryFromSC)))
+        //    {
+        //        // Do not allow the swap chain to handle Alt+Enter
+        //        pFactoryFromSC->MakeWindowAssociation(hWnd, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
+        //    }
+        //}
 
 #elif PLATFORM_UNIVERSAL_WINDOWS
 
